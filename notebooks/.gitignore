@@ -1,0 +1,6 @@
+test_runs/
+lora_adapters/
+outputs/
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
