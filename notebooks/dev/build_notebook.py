@@ -32,9 +32,24 @@ md(r"""
 
 - 지원 모델 계열: `qwen_image`(Qwen-Image, 2512), `qwen_image21`, `flux2_klein`, `z_image`, `krea2`, `flux1`, `chroma`, `longcat_image`, `sdxl`, `sd3`.
 - 사용자가 바꾸는 값은 `0-2` 의 `USER` 뿐이다. 학습 조건(랭크, 학습률, optimizer, 단계 수 등)은 `FIXED` 에 고정되어 있고, 실행 중에 바꿀 수 없다.
+- `FIXED` 는 공통값에 계열별 시작값(공식 문서·예시 설정 기준)을 덮어쓴 것이다 (예: Krea 2 는 랭크 32, 학습률 3e-4, 1,000 단계).
 - 모델은 diffusers 형식 폴더(`model_index.json` 이 있는 폴더) 또는 Hugging Face 저장소 이름(예: `Qwen/Qwen-Image-2512`)으로 불러온다. 폴더면 `model_index.json` 의 파이프라인 종류가 `MODEL_FAMILY` 와 맞는지 먼저 확인한다.
 - 메인 서버 ComfyUI 의 단일 `.safetensors` 파일(예: `qwen_image_2512_fp8_e4m3fn.safetensors`)은 그대로 쓸 수 없다. 같은 모델의 diffusers 형식 폴더를 따로 받아 둔다.
 - 노트북은 실행한 폴더에 `lora_adapters/` 를 만든다.
+
+### 학습할 모델과 실제로 쓸 모델
+
+| 계열 | 학습할 모델 (`MODEL_PATH`) | 만든 LoRA 를 쓸 모델 | 라이선스 |
+|---|---|---|---|
+| `flux2_klein` | FLUX.2 [klein] Base 4B | 증류판 klein 4B (4 step) | Apache-2.0 (9B 는 비상업) |
+| `qwen_image` | Qwen-Image-2512 | 같은 모델 | Apache-2.0 |
+| `krea2` | Krea 2 Raw | Krea 2 Turbo (8 step) | 연매출 US$1M 미만만 상업 이용 |
+| `z_image` | Z-Image (base) | Z-Image Turbo (효과가 듣는지 미확인) | Apache-2.0 |
+| `qwen_image21` | Qwen-Image 2.1 | 같은 모델 | 비상업 |
+
+- 증류판(Turbo, 4~8 step)을 직접 학습하면 적은 step 생성이 깨지므로, 위 표의 '학습할 모델' 로 학습한다.
+- 나머지 계열은 학습한 모델에 그대로 쓴다.
+- 노트북의 검증 샘플은 학습한 모델로 그린 진행 확인용이고, 최종 판정은 ComfyUI 에서 '쓸 모델' 로 한다 (5-5 절).
 
 ### 데이터셋 폴더
 
@@ -105,7 +120,12 @@ md(r"""
 ### 0-2. 설정
 
 - `USER` 만 바꾼다. 환경변수로도 줄 수 있다 (예: `LORA_MODEL_FAMILY`, `LORA_MODEL_PATH`).
-- `FIXED` 는 계획서(`lora-training-plan.md` 3-3 절)와 diffusers 공식 학습 스크립트 기본값을 따른 고정값이다. 읽기 전용이라 실행 중에 바꾸면 오류가 난다.
+- `FIXED` 는 공통값(계획서 파일럿 시작값과 diffusers 공식 학습 스크립트 기본값)에 계열별 시작값 `FAMILY_FIXED` 를 덮어쓴 고정값이다. 출처는 계획서(`lora-training-plan.md` 3-3 절)에 있다. 읽기 전용이라 실행 중에 바꾸면 오류가 난다.
+- 랭크와 알파는 늘 같게 둔다. diffusers 로 저장한 LoRA 파일에는 alpha 텐서가 없고, ComfyUI 는 이때 강도를 1(알파 = 랭크)로 적용하기 때문이다.
+- 검증 프롬프트는 기본 4개를 쓰고, 캐릭터에 맞게 바꾸려면 `VALIDATION_FILE` 에 JSON 파일을 준다.
+  - 예: `{"prompts": ["nkgreen, full body, front view, standing, plain light gray background"], "negative": "photorealistic, text", "seeds": [1001]}`
+  - `negative`, `seeds` 는 빼도 된다. 트리거가 없는 프롬프트는 앞에 트리거를 붙인다.
+- 기본 부정어에 손·손가락을 넣지 않는다. 손을 숨기는 특징을 LoRA 가 배웠는지 봐야 하고, 실제로 쓸 증류판(cfg 1)은 부정어를 거의 듣지 않는다.
 """)
 code(r'''
 TEST_FAMILY = os.environ.get("LORA_NB_TEST", "").strip()   # 시험 실행이면 모델 계열 이름
@@ -117,9 +137,10 @@ USER = MappingProxyType(dict(
     OUTPUT_DIR=os.environ.get("LORA_OUTPUT_DIR", "outputs"),
     TRIGGER=os.environ.get("LORA_TRIGGER", "nkgreen"),
     RUN_NAME=os.environ.get("LORA_RUN_NAME", "nkgreen_v1"),
+    VALIDATION_FILE=os.environ.get("LORA_VALIDATION_FILE", ""),   # 비우면 아래 기본 검증 프롬프트
 ))
 
-FIXED = MappingProxyType(dict(
+COMMON_FIXED = dict(
     seed=42,
     # LoRA
     rank=16, alpha=16, dropout=0.0, init_lora_weights="gaussian",
@@ -137,7 +158,18 @@ FIXED = MappingProxyType(dict(
     # 저장·검증
     save_every=250, validate_every=250, val_loss_images=4, val_sigmas=(0.1, 0.3, 0.5, 0.7, 0.9),
     max_nan_steps=10, min_image_side=512,
-))
+)
+# 계열별 시작값 (공식 문서·예시 설정 기준, 출처는 계획서 3-3 절). 여기 없는 계열은 공통값을 쓴다.
+FAMILY_FIXED = {
+    "flux2_klein": dict(max_train_steps=2000),                                   # BFL: 캐릭터 1,500~3,000 단계, 학습률 8e-5~1e-4
+    "qwen_image": dict(max_train_steps=2000),                                    # ai-toolkit Qwen-Image 예시: 랭크 16, 학습률 1e-4
+    "krea2": dict(rank=32, alpha=32, learning_rate=3e-4, max_train_steps=1000),  # diffusers v0.42.1 README_krea2 예시
+    "z_image": dict(rank=32, alpha=32),                                          # musubi-tuner Z-Image 예시: dim 32, 학습률 1e-4
+}
+FIXED = MappingProxyType({**COMMON_FIXED, **FAMILY_FIXED.get(USER["MODEL_FAMILY"], {})})
+if FIXED["alpha"] != FIXED["rank"]:
+    raise ValueError(f"alpha({FIXED['alpha']}) 와 rank({FIXED['rank']}) 가 다릅니다. ComfyUI 는 alpha 텐서가 없는 LoRA 를 "
+                     "alpha = rank 로 적용하므로 학습 때와 세기가 달라집니다. 둘을 같게 둡니다.")
 
 TEST_DEVICE = os.environ.get("LORA_NB_TEST_DEVICE", "cpu")   # 시험 실행 장치: cpu(fp32) 또는 cuda(bf16)
 if TEST_FAMILY:   # 시험 실행: 같은 코드 경로를 아주 작은 값으로
@@ -145,15 +177,56 @@ if TEST_FAMILY:   # 시험 실행: 같은 코드 경로를 아주 작은 값으�
                               "val_loss_images": 2, "min_image_side": 8,
                               "mixed_precision": "bf16" if TEST_DEVICE == "cuda" else "fp32"})
 
+def model_notes(family, path):
+    """학습할 모델과 라이선스에 대한 주의. 경로 이름으로만 판단하므로 틀릴 수 있다."""
+    p = path.lower()
+    notes = []
+    if family == "flux2_klein" and "base" not in p:
+        notes.append("FLUX.2 [klein] 은 Base 모델로 학습하고, 만든 LoRA 는 증류판(4 step)에서 쓴다.")
+    if family in ("z_image", "krea2") and "turbo" in p:
+        notes.append("Turbo(증류) 모델을 학습하면 적은 step 생성이 깨진다. Z-Image 는 base, Krea 2 는 Raw 로 학습한다.")
+    if family == "qwen_image21" or (family == "flux2_klein" and "9b" in p) or (family == "flux1" and "schnell" not in p):
+        notes.append("비상업 라이선스 모델이다 (Qwen-Image 2.1, FLUX.2 [klein] 9B, FLUX.1 dev 계열). 작품용 LoRA 에 쓰지 않는다.")
+    if family in ("krea2", "sd3"):
+        notes.append("매출 조건부 라이선스다 (연매출 US$1M 미만만 상업 이용). 회사 조건을 확인한다.")
+    return notes
+
+if not TEST_FAMILY:
+    for _note in model_notes(USER["MODEL_FAMILY"], USER["MODEL_PATH"]):
+        print("주의:", _note)
+
+# 검증 프롬프트: 기본 4개, 또는 VALIDATION_FILE(JSON)
+_TRIG = re.compile(r"(?<!\w)" + re.escape(USER["TRIGGER"]) + r"(?![A-Za-z0-9_])")
 VALIDATION_PROMPTS = [
     f"{USER['TRIGGER']}, full body, front view, standing, plain light gray background, clean anime illustration",
-    f"{USER['TRIGGER']}, upper body, three-quarter view from the left, shy small smile, summer meadow, clean anime illustration",
+    f"{USER['TRIGGER']}, upper body, three-quarter view from the left, small smile, summer meadow, clean anime illustration",
     f"{USER['TRIGGER']}, close-up, side view, calm look into the distance, plain light gray background, clean anime illustration",
     f"{USER['TRIGGER']}, full body, back view, standing, forest path, clean anime illustration",
 ]
-VALIDATION_NEGATIVE = "photorealistic, 3d render, text, watermark, blurry, deformed, extra limbs, hands, fingers, multiple people"
-VALIDATION_SEEDS = [1001, 1002, 1003, 1004]
+VALIDATION_NEGATIVE = "photorealistic, 3d render, text, watermark, blurry, deformed, extra limbs, multiple people"
+VALIDATION_SEEDS = None
+if USER["VALIDATION_FILE"]:
+    _vf = Path(USER["VALIDATION_FILE"]).expanduser()
+    if not _vf.is_file():
+        raise FileNotFoundError(f"VALIDATION_FILE 이 없습니다: {_vf}")
+    _v = json.loads(_vf.read_text(encoding="utf-8-sig"))
+    _p = _v.get("prompts") if isinstance(_v, dict) else None
+    if not isinstance(_p, list) or not _p or not all(isinstance(x, str) and x.strip() for x in _p):
+        raise ValueError(f"{_vf.name}: prompts 는 비어 있지 않은 문자열 목록이어야 합니다")
+    VALIDATION_PROMPTS = [x.strip() if _TRIG.search(x) else f"{USER['TRIGGER']}, {x.strip()}" for x in _p]
+    VALIDATION_NEGATIVE = _v.get("negative", VALIDATION_NEGATIVE)
+    VALIDATION_SEEDS = _v.get("seeds")
+if VALIDATION_SEEDS is None:
+    VALIDATION_SEEDS = [1001 + i for i in range(len(VALIDATION_PROMPTS))]
+if not isinstance(VALIDATION_NEGATIVE, str):
+    raise ValueError("검증 negative 는 문자열이어야 합니다")
+if not isinstance(VALIDATION_SEEDS, list) or len(VALIDATION_SEEDS) != len(VALIDATION_PROMPTS) \
+        or not all(isinstance(s, int) and not isinstance(s, bool) for s in VALIDATION_SEEDS):
+    raise ValueError(f"검증 seeds 는 prompts 와 개수가 같은 정수 목록이어야 합니다 (prompts {len(VALIDATION_PROMPTS)}개)")
 print(json.dumps(dict(USER), ensure_ascii=False, indent=1))
+print("계열별 시작값:", FAMILY_FIXED.get(USER["MODEL_FAMILY"]) or "없음 (공통값)",
+      "| 랭크", FIXED["rank"], "| 학습률", FIXED["learning_rate"], "| 단계", FIXED["max_train_steps"])
+print(f"검증 프롬프트 {len(VALIDATION_PROMPTS)}개", f"({USER['VALIDATION_FILE']})" if USER["VALIDATION_FILE"] else "(기본)")
 ''')
 
 md(r"""
@@ -718,7 +791,9 @@ print("단계별 검증 손실:", {s: round(v, 4) for s, v in val_history})
 print("검증 손실이 가장 낮은 저장 단계:", best_step, "(최종 선택은 샘플을 사람이 보고 정한다)")
 ''')
 
-md("### 5-2. 단계별 샘플 비교 (같은 프롬프트·같은 시드)")
+md("### 5-2. 단계별 샘플 비교 (같은 프롬프트·같은 시드)\n\n"
+   "샘플은 학습한 모델(예: klein Base 50 step)로 그린 진행 확인용이다. "
+   "실제로 쓸 증류판에서의 최종 판정은 5-5 절대로 ComfyUI 에서 한다.")
 code(r'''
 steps_ = sorted(sample_history)
 fig, axes = plt.subplots(len(steps_), len(VALIDATION_PROMPTS), figsize=(3 * len(VALIDATION_PROMPTS), 3.3 * len(steps_)), squeeze=False)
@@ -726,7 +801,7 @@ for r, s in enumerate(steps_):
     for c, img in enumerate(sample_history[s]):
         ax = axes[r][c]; ax.imshow(img); ax.axis("off")
         if r == 0:
-            ax.set_title(VALIDATION_PROMPTS[c][len(USER["TRIGGER"]) + 2:][:34], fontsize=7)
+            ax.set_title(_TRIG.sub("", VALIDATION_PROMPTS[c]).strip(" ,")[:34], fontsize=7)
         if c == 0:
             ax.text(-0.05, 0.5, f"step {s}", transform=ax.transAxes, rotation=90, va="center", ha="right", fontsize=9)
 plt.suptitle("0 단계 = 베이스 모델, 아래로 갈수록 학습이 진행된 LoRA"); plt.tight_layout(); plt.show()
@@ -757,6 +832,7 @@ dataset_hash = hashlib.sha1("".join(sorted(df.sha1 + df.train_caption)).encode()
 summary = dict(
     family=A.FAMILY, model_path=USER["MODEL_PATH"] if not TEST_FAMILY else "tiny-test", run_dir=str(RUN_DIR),
     trigger=USER["TRIGGER"], images=len(df), dataset_sha1=dataset_hash, fixed=dict(FIXED),
+    validation=dict(prompts=VALIDATION_PROMPTS, negative=VALIDATION_NEGATIVE, seeds=VALIDATION_SEEDS),
     steps_done=len(history), nan_steps=nan_steps, train_minutes=round(train_sec / 60, 2),
     peak_gpu_gb=None if math.isnan(peak_gb) else round(peak_gb, 2),
     final_train_loss=float(pd.DataFrame(history).loss.tail(20).mean()) if history else None,
@@ -771,6 +847,23 @@ if TEST_FAMILY:
     print(f"\nNOTEBOOK TEST OK {TEST_FAMILY}")
 ''')
 
+md(r"""
+### 5-5. ComfyUI 에서 확인할 것 (노트북 밖)
+
+5-3 의 다시 불러오기 확인은 diffusers 기준이다. 실제 사용은 ComfyUI 이므로 아래를 따로 확인한다.
+
+- 고른 단계의 LoRA 를 `model-inbox` 절차로 `/srv/models/loras` 에 등록한다.
+- 맨 위 '학습할 모델과 실제로 쓸 모델' 표의 '쓸 모델' 로 고정 워크플로우를 돌린다.
+  - 예: klein 은 증류판 4B 4 step cfg 1, Krea 2 는 Turbo 8 step
+- ComfyUI 콘솔에 `lora key not loaded` 경고가 0건인지 본다. ComfyUI 는 모르는 키를 경고만 남기고 버려서, 경고가 있으면 LoRA 일부가 빠진 채 그려진다.
+  - 예: Krea 2 는 LoRA 대상 층이 15종(img_in, txt_in, time_embed 등)이라 특히 확인
+- 랭크와 알파가 같으므로 LoRA 강도 1.0 이 학습 때 세기다.
+- 캐릭터 핵심 특징 체크리스트(시각 모델), 애니 캐릭터 동일성 점수(CCIP), 블라인드 검수로 단계를 고른다.
+- 캐릭터 LoRA 두 개를 함께 건 두 인물 장면도 그려 특징이 섞이는지 본다.
+""")
+
+for i, c in enumerate(cells):   # 셀 id 를 고정해, 다시 만들 때 diff 에 내용 변경만 남게 한다
+    c["id"] = f"cell-{i:02d}"
 nb = nbf.v4.new_notebook()
 nb["cells"] = cells
 nb["metadata"] = {"kernelspec": {"name": "python3", "display_name": "Python 3", "language": "python"},
