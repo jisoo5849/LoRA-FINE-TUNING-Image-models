@@ -17,6 +17,7 @@
 | `prompts/nkgreen_qwen2512_prompts_ko.md` | 같은 내용의 한글판과 프롬프트 작성 규칙 |
 | `prompts/nkgreen_shots.json`, `prompts/build_nkgreen_prompts.py` | 컷별 데이터와 두 문서를 만드는 스크립트 |
 | `notebooks/lora_training.ipynb` | LoRA 학습 노트북 (EDA → 전처리 → 시각화 → 학습 → 검증) |
+| `notebooks/run_many.py`, `notebooks/run_many_example.json` | 여러 모델·캐릭터 학습을 목록대로 차례로 실행하는 스크립트와 목록 예 |
 | `notebooks/dev/` | 노트북을 만드는 빌더, 모델 계열별 어댑터 원본, 시험 도구 |
 
 ## 프롬프트 (니키 `nkgreen`)
@@ -41,6 +42,29 @@
 - 모델마다 다른 부분(텍스트 인코딩, 잠재값 정규화, 노이즈 공식, 잠재값 묶기, LoRA 대상 층, 저장 형식)은 계열별 어댑터가 맡고, 각 어댑터는 diffusers v0.42.1 공식 학습 스크립트와 대조했습니다.
 - 버전 고정: torch 2.15.0, diffusers 0.42.1, peft 0.21.2, transformers 5.22.1, accelerate 1.15.0
 - 모델은 diffusers 형식 폴더나 Hugging Face 저장소 이름으로 불러옵니다. ComfyUI 용 단일 `.safetensors` 파일은 쓸 수 없습니다.
+
+### 여러 모델·캐릭터를 차례로 학습 (`notebooks/run_many.py`)
+
+- 실행 목록(JSON)의 항목마다 노트북을 새 커널로 한 번씩 차례로 돌립니다.
+  - 예: [run_many_example.json](notebooks/run_many_example.json) 은 니키를 klein Base 4B 와 Qwen-Image-2512 에 차례로 학습
+- 항목의 값은 노트북 `USER` 값(`LORA_*` 환경변수)이 되고, `defaults` 는 항목에 없는 값을 채웁니다. 상대 경로는 목록 파일 폴더 기준입니다.
+- 시작 전에 목록 전체를 검사해, 문제가 하나라도 있으면 아무것도 실행하지 않습니다.
+  - 예: 지원하지 않는 계열, 빠진 값, 같은 실행 이름, 없는 데이터셋·모델·검증 파일
+- `summary.json` 이 있는 실행은 건너뛰고, 중단·실패로 끝나지 않은 폴더는 `<실행 이름>.incomplete-<시각>` 으로 옮긴 뒤 처음부터 다시 합니다.
+- 한 실행이 실패해도 다음으로 넘어가고(`--stop-on-error` 면 멈춤), 끝에 결과 표를 보여 줍니다.
+- 실행한 노트북은 `<실행 폴더>/executed.ipynb` 에, 실행마다 한 줄 기록(시간, 최대 메모리, 파일 크기, 손실)은 `<output_dir>/run_many_log.csv` 에 남습니다.
+- 학습용 가상환경의 python 으로 실행하고, 메인 서버에서는 관리자 '대기열 멈춤' 상태에서만 돌립니다 (계획서 P2).
+
+```
+cd notebooks
+python run_many.py run_many_example.json --dry-run   # 검사와 실행 계획만
+python run_many.py run_many_example.json --test      # 시험 모드(작은 무작위 모델)로 계열별 확인
+python run_many.py run_many_example.json             # 실제 학습
+```
+
+- 이 스크립트는 환경변수를 읽어 `summary.json` 만 쓰는 가짜 노트북으로 8가지 경우를 시험했습니다 (2026-11-02).
+  - 예: 목록 검사 오류, 미리 보기, 실행 간 환경변수 초기화, 건너뛰기, 끝나지 않은 폴더 옮기기, 실패 뒤 계속, `--stop-on-error`, 시험 모드
+- 실제 학습으로는 아직 돌려 보지 않았습니다 [TBD].
 
 ### 오류 검사 결과 (2026-11-02)
 

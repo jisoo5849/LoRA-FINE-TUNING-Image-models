@@ -1,0 +1,12 @@
+{
+  "defaults": {
+    "dataset_dir": "dataset/nkgreen",
+    "trigger": "nkgreen",
+    "validation_file": "",
+    "output_dir": "outputs"
+  },
+  "runs": [
+    {"family": "flux2_klein", "model_path": "/srv/models/diffusers/FLUX.2-klein-base-4B", "run_name": "nkgreen_klein4b_v1"},
+    {"family": "qwen_image", "model_path": "/srv/models/diffusers/Qwen-Image-2512", "run_name": "nkgreen_qwen2512_v1"}
+  ]
+}
