@@ -28,7 +28,7 @@ md(r"""
 | 2. 전처리 | 비율별 묶음(bucket)으로 자르고, 이미지 잠재값과 텍스트 임베딩을 미리 계산 |
 | 3. 시각화 | 전처리 결과, 비율·캡션 분포, 잠재값 통계를 그림으로 확인 |
 | 4. 학습 | LoRA 를 붙여 학습하고, 정해진 단계마다 저장·검증 |
-| 5. 검증 | 손실 곡선, 단계별 샘플 비교, 저장 파일 다시 불러오기 확인, 결과 요약 |
+| 5. 검증 | 손실 곡선, 단계별 샘플 비교, 저장 파일 다시 불러오기 확인, 새 프롬프트로 시험, 결과 요약 |
 
 - 지원 모델 계열: `qwen_image`(Qwen-Image, 2512), `qwen_image21`, `flux2_klein`, `z_image`, `krea2`, `flux1`, `chroma`, `longcat_image`, `sdxl`, `sd3`.
 - 사용자가 바꾸는 값은 `0-2` 의 `USER` 뿐이다. 학습 조건(랭크, 학습률, optimizer, 단계 수 등)은 `FIXED` 에 고정되어 있고, 실행 중에 바꿀 수 없다.
@@ -49,7 +49,7 @@ md(r"""
 
 - 증류판(Turbo, 4~8 step)을 직접 학습하면 적은 step 생성이 깨지므로, 위 표의 '학습할 모델' 로 학습한다.
 - 나머지 계열은 학습한 모델에 그대로 쓴다.
-- 노트북의 검증 샘플은 학습한 모델로 그린 진행 확인용이고, 최종 판정은 ComfyUI 에서 '쓸 모델' 로 한다 (5-5 절).
+- 노트북의 검증 샘플은 학습한 모델로 그린 진행 확인용이고, 최종 판정은 ComfyUI 에서 '쓸 모델' 로 한다 (5-6 절).
 
 ### 데이터셋 폴더
 
@@ -793,7 +793,7 @@ print("검증 손실이 가장 낮은 저장 단계:", best_step, "(최종 선�
 
 md("### 5-2. 단계별 샘플 비교 (같은 프롬프트·같은 시드)\n\n"
    "샘플은 학습한 모델(예: klein Base 50 step)로 그린 진행 확인용이다. "
-   "실제로 쓸 증류판에서의 최종 판정은 5-5 절대로 ComfyUI 에서 한다.")
+   "실제로 쓸 증류판에서의 최종 판정은 5-6 절대로 ComfyUI 에서 한다.")
 code(r'''
 steps_ = sorted(sample_history)
 fig, axes = plt.subplots(len(steps_), len(VALIDATION_PROMPTS), figsize=(3 * len(VALIDATION_PROMPTS), 3.3 * len(steps_)), squeeze=False)
@@ -826,7 +826,48 @@ check_img.save(RUN_DIR / "reload_check.png")
 print("다시 불러온 LoRA 로 생성 성공:", check_img.size)
 ''')
 
-md("### 5-4. 결과 요약 저장")
+md(r"""
+### 5-4. 새 프롬프트로 시험 (학습 데이터에 없던 장면)
+
+5-2 의 샘플은 정해 둔 프롬프트 4개뿐이다. 캐릭터를 정말 배웠는지는 학습 이미지에 없던 포즈·배경으로 그려 봐야 알 수 있다.
+
+- 5-3 셀 뒤에 실행하면 마지막 저장 LoRA 가 적용된 상태로 그린다.
+- `EXTRA_PROMPTS` 의 문장을 바꿔 이 셀만 다시 실행해도 된다. 트리거가 없는 문장은 앞에 트리거를 붙인다.
+- 그림과 프롬프트 기록은 `<실행 폴더>/extra_*.png`, `extra_prompts.txt` 에 남는다. 같은 시드로 다시 그리면 덮어쓴다.
+- 학습한 모델(예: klein Base 50 step)로 그린 것이라 최종 판정은 5-6 절대로 ComfyUI 에서 한다.
+""")
+code(r'''
+EXTRA_PROMPTS = [
+    "full body, sitting on a swing, sunset park, clean anime illustration",
+    "upper body, three-quarter view from the left, laughing, snowy street, clean anime illustration",
+    "close-up, front view, sleepy look, warm bedroom, clean anime illustration",
+]
+EXTRA_SEED = 2001    # 프롬프트마다 1씩 늘려 쓴다
+
+extra_prompts = [p.strip() if _TRIG.search(p) else f"{USER['TRIGGER']}, {p.strip()}" for p in EXTRA_PROMPTS]
+extra_seeds = [EXTRA_SEED + i for i in range(len(extra_prompts))]
+offload(OTHER_MODULES, DEVICE)           # 텍스트 인코더는 평소 CPU 에 있으므로 잠깐 GPU 로
+with torch.no_grad():
+    extra_conds = A.encode_prompts(pipe, extra_prompts, DEVICE, WEIGHT_DTYPE)
+offload(OTHER_MODULES, "cpu")
+if DEVICE.type == "cuda":
+    torch.cuda.empty_cache()
+extra_imgs = generate_images(extra_conds, extra_seeds)
+
+for i, (img, seed) in enumerate(zip(extra_imgs, extra_seeds), 1):
+    img.save(RUN_DIR / f"extra_{i:02d}_seed{seed}.png")
+(RUN_DIR / "extra_prompts.txt").write_text(
+    "\n".join(f"{i:02d} seed {s}: {p}" for i, (p, s) in enumerate(zip(extra_prompts, extra_seeds), 1)) + "\n", encoding="utf-8")
+
+fig, axes = plt.subplots(1, len(extra_imgs), figsize=(4 * len(extra_imgs), 4.6), squeeze=False)
+for ax, img, p in zip(axes[0], extra_imgs, extra_prompts):
+    ax.imshow(img); ax.axis("off")
+    ax.set_title(_TRIG.sub("", p).strip(" ,")[:40], fontsize=8)
+plt.suptitle("학습 데이터에 없던 장면 (마지막 저장 LoRA)"); plt.tight_layout(); plt.show()
+print(f"{len(extra_imgs)}장 저장:", RUN_DIR)
+''')
+
+md("### 5-5. 결과 요약 저장")
 code(r'''
 dataset_hash = hashlib.sha1("".join(sorted(df.sha1 + df.train_caption)).encode()).hexdigest()
 summary = dict(
@@ -848,7 +889,7 @@ if TEST_FAMILY:
 ''')
 
 md(r"""
-### 5-5. ComfyUI 에서 확인할 것 (노트북 밖)
+### 5-6. ComfyUI 에서 확인할 것 (노트북 밖)
 
 5-3 의 다시 불러오기 확인은 diffusers 기준이다. 실제 사용은 ComfyUI 이므로 아래를 따로 확인한다.
 
