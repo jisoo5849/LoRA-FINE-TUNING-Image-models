@@ -20,6 +20,7 @@
 - 실행한 노트북은 <실행 폴더>/executed.ipynb, 실행마다 한 줄 기록은 <output_dir>/run_many_log.csv 에 남는다.
 - --test 는 노트북 시험 모드(작은 무작위 모델, 가짜 데이터셋)로 목록의 계열이 이 환경에서 도는지 빠르게 본다.
 - 학습용 가상환경의 python 으로 실행한다 (기본 커널 python3 이 그 환경을 쓴다).
+- v2 노트북(--notebook lora_training_v2.ipynb)이면 target_scope, preservation, class_word 도 줄 수 있다 (빼면 노트북 기본값).
 - 메인 서버에서는 허브에 학습 작업이 생기기 전까지 관리자 '대기열 멈춤' 상태에서만 돌린다 (계획서 P2).
 """
 import argparse
@@ -43,7 +44,11 @@ KEYS = {  # 목록 파일의 키 → 노트북 환경변수
     "trigger": "LORA_TRIGGER",
     "run_name": "LORA_RUN_NAME",
     "validation_file": "LORA_VALIDATION_FILE",
+    "target_scope": "LORA_TARGET_SCOPE",     # v2 노트북만
+    "preservation": "LORA_PRESERVATION",     # v2 노트북만
+    "class_word": "LORA_CLASS_WORD",         # v2 노트북만
 }
+V2_CHOICES = {"target_scope": ("attn", "attn_all", "attn_mlp", "all"), "preservation": ("dop", "off")}
 REQUIRED = ["family", "model_path", "dataset_dir", "trigger", "run_name"]
 RUN_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
 HF_REPO = re.compile(r"[\w.-]+/[\w.-]+")   # 노트북 check_model_path 와 같은 규칙
@@ -75,7 +80,12 @@ def check_model_path(base, mp):
     return mp, None
 
 
-def load_plan(path, fams, test):
+def notebook_env_names(nb):
+    """노트북 코드가 읽는 LORA_* 환경변수 이름"""
+    return {m for c in nb.cells if c.cell_type == "code" for m in re.findall(r"LORA_[A-Z_]+", c.source)}
+
+
+def load_plan(path, fams, test, nb_env):
     """목록 파일을 실행 목록으로 바꾼다. 문제는 모두 모아 보여 주고, 하나라도 있으면 아무것도 실행하지 않는다."""
     try:
         plan = json.loads(path.read_text(encoding="utf-8-sig"))
@@ -120,6 +130,15 @@ def load_plan(path, fams, test):
             if not vf.is_file():
                 errors.append(f"{at}: 검증 프롬프트 파일이 없습니다: {vf}")
             env["LORA_VALIDATION_FILE"] = str(vf)
+        for k in ("target_scope", "preservation", "class_word"):
+            v = r.get(k, "").strip()
+            if not v:
+                continue
+            if KEYS[k] not in nb_env:
+                errors.append(f"{at}: 이 노트북은 '{k}' 를 쓰지 않습니다 (v2 노트북: --notebook lora_training_v2.ipynb)")
+            elif k in V2_CHOICES and v not in V2_CHOICES[k]:
+                errors.append(f"{at}: {k} 는 {', '.join(V2_CHOICES[k])} 중 하나여야 합니다: {v}")
+            env[KEYS[k]] = v
         if not test:   # 시험 모드는 작은 무작위 모델과 가짜 데이터셋을 쓰므로 경로를 보지 않는다
             if not Path(env["LORA_DATASET_DIR"]).is_dir():
                 errors.append(f"{at}: 데이터셋 폴더가 없습니다: {env['LORA_DATASET_DIR']}")
@@ -233,8 +252,8 @@ def main():
     args = ap.parse_args()
 
     nb_path = args.notebook.resolve()
-    fams = supported_families(nbformat.read(nb_path, as_version=4))
-    runs = load_plan(args.plan.resolve(), fams, args.test)
+    nb = nbformat.read(nb_path, as_version=4)
+    runs = load_plan(args.plan.resolve(), supported_families(nb), args.test, notebook_env_names(nb))
     print(f"{'시험' if args.test else '학습'} {len(runs)}건 | 노트북 {nb_path} | 커널 {args.kernel}"
           + (" | --dry-run: 실행하지 않음" if args.dry_run else ""))
     if not args.test and not args.dry_run:

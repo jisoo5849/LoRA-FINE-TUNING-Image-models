@@ -1,7 +1,12 @@
-"""Build lora_training.ipynb from cell sources + adapter files.
+"""Build lora_training.ipynb (v1) or lora_training_v2.ipynb (v2) from cell sources + adapter files.
 
-  python build_notebook.py <adapters_dir> <out.ipynb>
+  python build_notebook.py <adapters_dir> <out.ipynb> [v1|v2]
+
+v2 is v1 with the parts in v2_parts.py swapped in. Cell sources mark those parts:
+  # [v2:name]            one line: dropped in v1, replaced by V2[name] in v2
+  # [v1:name] ... # [/v1] region: kept in v1 (marker lines dropped), replaced by V2[name] in v2
 """
+import re
 import sys
 from pathlib import Path
 
@@ -9,15 +14,50 @@ import nbformat as nbf
 
 ADIR = Path(sys.argv[1])
 OUT = Path(sys.argv[2])
+VARIANT = sys.argv[3] if len(sys.argv) > 3 else "v1"
+if VARIANT not in ("v1", "v2"):
+    raise SystemExit(f"variant must be v1 or v2: {VARIANT}")
 FAMILIES = ["qwen_image", "qwen_image21", "flux2_klein", "z_image", "krea2", "flux1", "chroma", "longcat_image",
             "sdxl", "sd3"]
+if VARIANT == "v2":
+    sys.path.insert(0, str(Path(__file__).parent))
+    from v2_parts import V2
+else:
+    V2 = {}
+_used = set()
+
+
+def apply_variant(s):
+    out, region = [], None
+    for line in s.split("\n"):
+        m = re.fullmatch(r"(\s*)# \[(v2|v1|/v1)(?::(\w+))?\]", line)
+        if not m:
+            if region is None or VARIANT == "v1":
+                out.append(line)
+            continue
+        indent, kind, name = m.groups()
+        if kind == "/v1":
+            assert region is not None, "unmatched # [/v1]"
+            region = None
+            continue
+        if kind == "v1":
+            assert region is None, f"nested region {name}"
+            region = name
+        if VARIANT == "v2":
+            _used.add(name)
+            out.extend(indent + l if l else l for l in V2[name].strip("\n").split("\n"))
+    assert region is None, f"unclosed region {region}"
+    return "\n".join(out)
+
 
 cells = []
-md = lambda s: cells.append(nbf.v4.new_markdown_cell(s.strip("\n")))
-code = lambda s: cells.append(nbf.v4.new_code_cell(s.strip("\n")))
+md = lambda s: cells.append(nbf.v4.new_markdown_cell(apply_variant(s.strip("\n"))))
+code = lambda s: cells.append(nbf.v4.new_code_cell(apply_variant(s.strip("\n"))))
 
 md(r"""
+# [v1:title]
 # 캐릭터 LoRA 학습 노트북 (diffusers + peft)
+# [/v1]
 
 이 노트북은 이미지 생성 모델에 캐릭터 LoRA 를 학습한다. 베이스 모델은 얼리고 LoRA 어댑터만 학습한다.
 
@@ -50,6 +90,7 @@ md(r"""
 - 증류판(Turbo, 4~8 step)을 직접 학습하면 적은 step 생성이 깨지므로, 위 표의 '학습할 모델' 로 학습한다.
 - 나머지 계열은 학습한 모델에 그대로 쓴다.
 - 노트북의 검증 샘플은 학습한 모델로 그린 진행 확인용이고, 최종 판정은 ComfyUI 에서 '쓸 모델' 로 한다 (5-6 절).
+# [v2:intro]
 
 ### 데이터셋 폴더
 
@@ -68,7 +109,9 @@ dataset/nkgreen/
 환경변수 `LORA_NB_TEST=<모델 계열>` 을 주고 실행하면, 같은 구조의 아주 작은 무작위 모델과 가짜 데이터셋으로 모든 셀을 끝까지 돌린다 (계열당 CPU 30초 안팎). 실제 학습 전에 환경이 맞는지 확인할 때 쓴다. 작은 토크나이저를 Hugging Face 에서 내려받으므로 인터넷이 필요하다. `LORA_NB_TEST_DEVICE=cuda` 를 더하면 GPU·bf16 으로 시험한다.
 
 ```
+# [v1:test_cmd]
 LORA_NB_TEST=qwen_image jupyter nbconvert --to notebook --execute lora_training.ipynb --output test_run.ipynb
+# [/v1]
 ```
 """)
 
@@ -126,18 +169,24 @@ md(r"""
   - 예: `{"prompts": ["nkgreen, full body, front view, standing, plain light gray background"], "negative": "photorealistic, text", "seeds": [1001]}`
   - `negative`, `seeds` 는 빼도 된다. 트리거가 없는 프롬프트는 앞에 트리거를 붙인다.
 - 기본 부정어에 손·손가락을 넣지 않는다. 손을 숨기는 특징을 LoRA 가 배웠는지 봐야 하고, 실제로 쓸 증류판(cfg 1)은 부정어를 거의 듣지 않는다.
+# [v2:setup_md]
 """)
 code(r'''
 TEST_FAMILY = os.environ.get("LORA_NB_TEST", "").strip()   # 시험 실행이면 모델 계열 이름
 
 USER = MappingProxyType(dict(
     MODEL_FAMILY=os.environ.get("LORA_MODEL_FAMILY", TEST_FAMILY or "qwen_image"),
+    # [v1:model_path]
     MODEL_PATH=os.environ.get("LORA_MODEL_PATH", "/srv/models/diffusers/Qwen-Image-2512"),
+    # [/v1]
     DATASET_DIR=os.environ.get("LORA_DATASET_DIR", "dataset/nkgreen"),
     OUTPUT_DIR=os.environ.get("LORA_OUTPUT_DIR", "outputs"),
     TRIGGER=os.environ.get("LORA_TRIGGER", "nkgreen"),
+    # [v1:run_name]
     RUN_NAME=os.environ.get("LORA_RUN_NAME", "nkgreen_v1"),
+    # [/v1]
     VALIDATION_FILE=os.environ.get("LORA_VALIDATION_FILE", ""),   # 비우면 아래 기본 검증 프롬프트
+    # [v2:user]
 ))
 
 COMMON_FIXED = dict(
@@ -166,10 +215,12 @@ FAMILY_FIXED = {
     "krea2": dict(rank=32, alpha=32, learning_rate=3e-4, max_train_steps=1000),  # diffusers v0.42.1 README_krea2 예시
     "z_image": dict(rank=32, alpha=32),                                          # musubi-tuner Z-Image 예시: dim 32, 학습률 1e-4
 }
+# [v2:fixed]
 FIXED = MappingProxyType({**COMMON_FIXED, **FAMILY_FIXED.get(USER["MODEL_FAMILY"], {})})
 if FIXED["alpha"] != FIXED["rank"]:
     raise ValueError(f"alpha({FIXED['alpha']}) 와 rank({FIXED['rank']}) 가 다릅니다. ComfyUI 는 alpha 텐서가 없는 LoRA 를 "
                      "alpha = rank 로 적용하므로 학습 때와 세기가 달라집니다. 둘을 같게 둡니다.")
+# [v2:user_check]
 
 TEST_DEVICE = os.environ.get("LORA_NB_TEST_DEVICE", "cpu")   # 시험 실행 장치: cpu(fp32) 또는 cuda(bf16)
 if TEST_FAMILY:   # 시험 실행: 같은 코드 경로를 아주 작은 값으로
@@ -183,8 +234,10 @@ def model_notes(family, path):
     notes = []
     if family == "flux2_klein" and "base" not in p:
         notes.append("FLUX.2 [klein] 은 Base 모델로 학습하고, 만든 LoRA 는 증류판(4 step)에서 쓴다.")
+    # [v1:turbo_note]
     if family in ("z_image", "krea2") and "turbo" in p:
         notes.append("Turbo(증류) 모델을 학습하면 적은 step 생성이 깨진다. Z-Image 는 base, Krea 2 는 Raw 로 학습한다.")
+    # [/v1]
     if family == "qwen_image21" or (family == "flux2_klein" and "9b" in p) or (family == "flux1" and "schnell" not in p):
         notes.append("비상업 라이선스 모델이다 (Qwen-Image 2.1, FLUX.2 [klein] 9B, FLUX.1 dev 계열). 작품용 LoRA 에 쓰지 않는다.")
     if family in ("krea2", "sd3"):
@@ -258,6 +311,8 @@ print("어댑터:", A.FAMILY, "| 파이프라인:", A.PIPELINE_CLASS.__name__, "
 ''')
 # replace %%writefile target dir creation: writefile needs the dir to exist -> create it before the adapter cells
 cells.insert(len(cells) - len(FAMILIES) - 1, nbf.v4.new_code_cell('os.makedirs("lora_adapters", exist_ok=True)'))
+if VARIANT == "v2":
+    md(V2["groups_md"]); code(V2["groups_code"]); _used.update({"groups_md", "groups_code"})
 
 md("### 0-4. 장치·정밀도 결정, 시드 고정, 모델 불러오기")
 code(r'''
@@ -545,6 +600,7 @@ with torch.no_grad():
     val_conds = A.encode_prompts(pipe, VALIDATION_PROMPTS, DEVICE, WEIGHT_DTYPE)
     neg_cond = A.encode_prompts(pipe, [VALIDATION_NEGATIVE], DEVICE, WEIGHT_DTYPE)[0]
     latents = [A.encode_images(pipe, to_tensor(im), DEVICE, WEIGHT_DTYPE) for im in tqdm(processed, desc="VAE")]
+    # [v2:encode]
 
 offload(OTHER_MODULES, "cpu")
 if DEVICE.type == "cuda":
@@ -588,7 +644,9 @@ print(f"잠재값 전체 평균 {np.mean(z_mean):.3f}, 표준편차 평균 {np.m
 md(r"""
 ## 4. 학습
 
+# [v1:train_md]
 - LoRA 를 디노이저의 어텐션 층(어댑터의 `LORA_TARGET_MODULES`)에 붙이고, 그 층만 학습한다.
+# [/v1]
 - 노이즈 단계: flow 계열은 logit-normal(0, 1) 로 시그마를 뽑고, eps/v 계열은 균등하게 뽑는다.
 - `save_every` 마다 LoRA 파일을, `validate_every` 마다 검증 손실과 고정 시드 샘플을 남긴다.
 - 손실이 NaN/Inf 인 단계는 건너뛰고, `max_nan_steps` 를 넘으면 멈춘다.
@@ -597,10 +655,13 @@ code(r'''
 RUN_DIR = Path(USER["OUTPUT_DIR"]) / (USER["RUN_NAME"] + (f"_test_{TEST_FAMILY}" if TEST_FAMILY else ""))
 if RUN_DIR.exists() and TEST_FAMILY:
     shutil.rmtree(RUN_DIR)
+# [v2:run_dir_guard]
 RUN_DIR.mkdir(parents=True, exist_ok=True)
 
+# [v1:lora_cfg]
 lora_cfg = LoraConfig(r=FIXED["rank"], lora_alpha=FIXED["alpha"], lora_dropout=FIXED["dropout"],
                       init_lora_weights=FIXED["init_lora_weights"], target_modules=list(A.LORA_TARGET_MODULES))
+# [/v1]
 denoiser.to(DEVICE)
 denoiser.add_adapter(lora_cfg)
 lora_params = [p for n, p in denoiser.named_parameters() if "lora_" in n]
@@ -612,6 +673,7 @@ for p in lora_params:            # 학습 파라미터는 fp32 (공식 스크립
     p.data = p.data.float()
 n_targets = len({n.rsplit(".lora_", 1)[0] for n, _ in denoiser.named_parameters() if "lora_A" in n})
 print(f"LoRA 층 {n_targets}개, 학습 파라미터 {sum(p.numel() for p in lora_params) / 1e6:.2f}M")
+# [v2:groups_report]
 
 def to_dev(cond):
     return {k: (v.to(DEVICE) if torch.is_tensor(v) else v) for k, v in cond.items()}
@@ -642,8 +704,10 @@ if FIXED["gradient_checkpointing"] and A.FAMILY not in NO_GC_FAMILIES \
 else:
     print("그래디언트 체크포인트 끔")
 
+# [v1:optimizer]
 optimizer = torch.optim.AdamW(lora_params, lr=FIXED["learning_rate"], betas=FIXED["betas"],
                               weight_decay=FIXED["weight_decay"], eps=FIXED["eps"])
+# [/v1]
 lr_scheduler = get_scheduler(FIXED["lr_scheduler"], optimizer=optimizer, num_warmup_steps=FIXED["warmup_steps"],
                              num_training_steps=FIXED["max_train_steps"])
 
@@ -671,6 +735,7 @@ def sample_sigma(gen):
         return s.clamp(1e-3, 1 - 1e-3)
     return torch.rand((FIXED["batch_size"],), generator=gen).clamp(1e-3, 1 - 1e-3)
 
+# [v2:pres_fn]
 # 검증 손실: 고정 이미지 · 고정 노이즈 · 고정 시그마 → 단계끼리 비교 가능
 _vg = torch.Generator("cpu").manual_seed(FIXED["seed"] + 7)
 VAL_IDX = list(range(min(FIXED["val_loss_images"], len(latents))))
@@ -713,6 +778,7 @@ def make_samples(step):
     out = generate_images(val_conds, VALIDATION_SEEDS)
     for img, seed in zip(out, VALIDATION_SEEDS):
         img.save(RUN_DIR / f"sample_step{step:05d}_seed{seed}.png")
+    # [v2:drift]
     return out
 
 def save_checkpoint(step):
@@ -722,6 +788,7 @@ def save_checkpoint(step):
     return A.save_lora(pipe, sd, str(d))
 
 history, val_history, sample_history, ckpt_paths = [], [], {}, {}
+# [v2:drift_init]
 val_history.append((0, validation_loss()))
 sample_history[0] = make_samples(0)             # LoRA B=0 으로 시작하므로 0 단계 = 베이스 모델
 print(f"0 단계 검증 손실 {val_history[-1][1]:.4f}")
@@ -734,6 +801,7 @@ pbar = tqdm(range(1, FIXED["max_train_steps"] + 1), desc="학습")
 for step in pbar:
     optimizer.zero_grad(set_to_none=True)
     step_loss = 0.0
+    # [v2:step_init]
     for _ in range(FIXED["grad_accum_steps"]):
         if not order:                       # 한 에폭마다 섞기 (시드 고정)
             order = torch.randperm(len(latents), generator=gen).tolist()
@@ -741,11 +809,13 @@ for step in pbar:
         x0 = latents[i].to(DEVICE)
         noise = torch.randn(x0.shape, generator=gen).to(DEVICE)
         sigma = sample_sigma(gen).to(DEVICE)
+        # [v1:train_step]
         loss = A.forward_loss(pipe, denoiser, x0, to_dev(caption_conds[i]), noise, sigma)
         if not torch.isfinite(loss):
             break
         (loss / FIXED["grad_accum_steps"]).backward()
         step_loss += float(loss) / FIXED["grad_accum_steps"]
+        # [/v1]
     grad_norm = float("nan")
     if math.isfinite(step_loss) and torch.isfinite(loss):
         grad_norm = float(torch.nn.utils.clip_grad_norm_(lora_params, FIXED["max_grad_norm"]))
@@ -759,6 +829,7 @@ for step in pbar:
         history.append(dict(step=step, loss=step_loss, lr=lr_scheduler.get_last_lr()[0], grad_norm=grad_norm,
                             sigma=float(sigma.mean()), sec=time.time() - t_start))
         pbar.set_postfix(loss=f"{step_loss:.4f}", lr=f"{history[-1]['lr']:.1e}")
+        # [v2:history_pres]
     # 건너뛴 단계여도 저장·검증은 한다 (가중치는 직전 단계와 같음)
     if step % FIXED["save_every"] == 0 or step == FIXED["max_train_steps"]:
         ckpt_paths[step] = save_checkpoint(step)
@@ -806,6 +877,8 @@ for r, s in enumerate(steps_):
             ax.text(-0.05, 0.5, f"step {s}", transform=ax.transAxes, rotation=90, va="center", ha="right", fontsize=9)
 plt.suptitle("0 단계 = 베이스 모델, 아래로 갈수록 학습이 진행된 LoRA"); plt.tight_layout(); plt.show()
 ''')
+if VARIANT == "v2":
+    md(V2["drift_md"]); code(V2["drift_code"]); _used.update({"drift_md", "drift_code"})
 
 md("### 5-3. 저장한 LoRA 파일 다시 불러오기 확인\n\n학습한 어댑터를 지우고 마지막 저장 파일을 `load_lora_weights` 로 다시 불러와, 값이 같은지와 이미지가 나오는지 확인한다.")
 code(r'''
@@ -881,6 +954,7 @@ summary = dict(
     checkpoints={int(s): str(p) for s, p in ckpt_paths.items()},
     lora_file_mb=round(Path(final_path).stat().st_size / 1e6, 2) if Path(final_path).is_file() else None,
     versions={k: _md.version(k) for k in PINNED},
+    # [v2:summary]
 )
 (RUN_DIR / "summary.json").write_text(json.dumps(summary, ensure_ascii=False, indent=1, default=str), encoding="utf-8")
 print(json.dumps(summary, ensure_ascii=False, indent=1, default=str))
@@ -901,8 +975,11 @@ md(r"""
 - 랭크와 알파가 같으므로 LoRA 강도 1.0 이 학습 때 세기다.
 - 캐릭터 핵심 특징 체크리스트(시각 모델), 애니 캐릭터 동일성 점수(CCIP), 블라인드 검수로 단계를 고른다.
 - 캐릭터 LoRA 두 개를 함께 건 두 인물 장면도 그려 특징이 섞이는지 본다.
+# [v2:comfy]
 """)
 
+if VARIANT == "v2" and set(V2) - _used:
+    raise SystemExit(f"v2_parts not used: {sorted(set(V2) - _used)}")
 for i, c in enumerate(cells):   # 셀 id 를 고정해, 다시 만들 때 diff 에 내용 변경만 남게 한다
     c["id"] = f"cell-{i:02d}"
 nb = nbf.v4.new_notebook()
@@ -910,5 +987,6 @@ nb["cells"] = cells
 nb["metadata"] = {"kernelspec": {"name": "python3", "display_name": "Python 3", "language": "python"},
                   "language_info": {"name": "python"}}
 nbf.validate(nb)
+OUT.parent.mkdir(parents=True, exist_ok=True)
 OUT.write_text(nbf.writes(nb), encoding="utf-8", newline="\n")
 print("wrote", OUT, len(cells), "cells")
