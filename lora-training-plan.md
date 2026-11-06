@@ -26,7 +26,7 @@
 | 2순위 베이스 | Qwen-Image-2512 | 2차 컨셉아트 그림체와 같은 모델, Apache 2.0, 다만 20B 라 학습이 느림 | 파일럿 뒤 결정 |
 | 학습 도구 | 자체 노트북 (diffusers 0.42.1 + peft 0.21.2) | 10개 계열 어댑터가 이미 있고, Apache 2.0 라이브러리만 써서 도구 라이선스 문제가 없음 | 자체 구현으로 정함 (2026-11-02) |
 | 구현 검증용 도구 | diffusers 공식 `train_dreambooth_lora_flux2_klein.py` | 노트북 어댑터가 이 스크립트를 옮긴 것이라 같은 조건으로 비교할 수 있음 | P2 에서 1회 |
-| 영상 학습 도구 | ai-toolkit (ostris) 또는 Musubi Tuner (kohya-ss) | 노트북은 영상을 지원하지 않고, 둘 다 Wan 2.2 A14B 를 지원함 | [TBD] |
+| 영상 학습 도구 | 자체 영상 노트북 (`notebooks/lora_training_video.ipynb`, Wan 2.1·2.2) | 이미지 노트북과 같은 라이브러리(Apache 2.0)로 만들고, ComfyUI 가 읽는 Wan 원래 키로 저장함. ai-toolkit·Musubi Tuner 는 비교용 | 2026-11-05 만듦, 실제 가중치 학습 [TBD] |
 | 트리거 낱말 | `nkgreen` | 실제 영어 낱말과 겹치지 않는 짧은 말 | [TBD] 캐릭터별 규칙 |
 | 데이터셋 | 새로 만들어진 것을 받음 | 2026-11-02 사용자 결정 | 받는 시점 [TBD] |
 | 캡션 | 데이터셋과 함께 오는지 확인 | 없으면 3-2 절 방식으로 만듦 | [TBD] |
@@ -47,8 +47,8 @@
 | Qwen-Image 2512 | 2512 | 2512 | Apache-2.0 | 랭크 16, 학습률 1e-4, 2,000 단계 (ai-toolkit 예시) | 2순위 (20B 라 느림) |
 | Krea 2 | Raw | Turbo (8 step) | 계열사 포함 연매출 US$1M 미만만 상업 이용 | 랭크·알파 32, 학습률 3e-4, 1,000 단계 (diffusers 예시) | 회사 매출 조건 확인 뒤 |
 | Z-Image | base | Turbo | Apache-2.0 | dim 32, 학습률 1e-4 (musubi-tuner 예시) | 후순위 |
-| Wan 2.2 A14B (영상) | high·low 두 전문가 | 같은 모델 | Apache-2.0 | 이미지만, 랭크 32, 학습률 1e-4, 2,000 단계 (ai-toolkit 예시) | 영상 1순위 |
-| LTX-2.3 (영상) | 2.3 | 같은 모델 | 연매출 US$10M 미만 | 공식 `ltx-trainer` | 보류 |
+| Wan 2.2 A14B (영상) | high·low 두 전문가 | 같은 모델 | Apache-2.0 | 이미지만, 랭크 32, 학습률 1e-4, 2,000 단계 (ai-toolkit 예시). 영상 노트북 기본은 랭크 16, 2,000 단계 | 영상 1순위 |
+| LTX-2.3 (영상) | 2.3 | 같은 모델 | 연매출 US$10M 미만 | 공식 `ltx-trainer` | 제외 (출력물로 다른 모델 상업 학습 금지, 2026-11-05) |
 
 - klein 은 BFL 블로그에 Base 로 학습한 LoRA 가 증류판에서 "대개 더 좋다" 고 나와 있다.
 - Z-Image 는 base 로 학습한 LoRA 가 Turbo 에서 듣는지 공식 근거가 없고, 커뮤니티 보고도 엇갈린다.
@@ -58,7 +58,9 @@
 - Qwen-Image 2.1 은 Qwen RESEARCH License(비상업)라 작품용에서 뺀다.
 - LoRA 는 학습한 계열에서만 동작하므로, 모델을 하나 늘릴 때마다 9명분 학습·검증·재학습이 함께 늘어난다.
 - 영상은 캐릭터 LoRA 로 만든 첫 화면을 Wan 2.2 I2V 에 넣는 방식을 기본으로 하고, 뒤돌거나 가려졌다 나오는 장면에서 얼굴이 흔들릴 때 Wan 2.2 LoRA 를 더한다 [판단].
-- Wan 2.2 A14B LoRA 는 high-noise·low-noise 두 파일로 나오고, 노트북이 아니라 ai-toolkit 이나 musubi-tuner 로 학습한다.
+- Wan 2.2 A14B LoRA 는 클립이 있으면 high-noise·low-noise 두 파일, 이미지만이면 low-noise 파일 하나로 나오고 (고노이즈 모델에는 LoRA 를 걸지 않음), 영상 노트북(2026-11-05)으로 학습한다.
+  - 영상 노트북은 Wan2.2-T2V-A14B·I2V-A14B·TI2V-5B, Wan2.1-T2V 를 지원하고, 계열은 모델 폴더에서 자동으로 정한다.
+  - HunyuanVideo·HunyuanVideo-1.5·MiniMax H3 는 라이선스가 대한민국을 제외해서, Kandinsky 5·6 은 HunyuanVideo VAE 를 포함해서 뺐다.
 
 ## 2. 전체 흐름
 

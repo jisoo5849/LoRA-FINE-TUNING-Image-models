@@ -1,6 +1,9 @@
 test_runs/
 lora_adapters/
 outputs/
+lora_video_adapters/
+lora_video_tools/
+outputs_video/
 __pycache__/
 *.pyc
 .ipynb_checkpoints/

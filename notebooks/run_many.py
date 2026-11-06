@@ -21,6 +21,9 @@
 - --test 는 노트북 시험 모드(작은 무작위 모델, 가짜 데이터셋)로 목록의 계열이 이 환경에서 도는지 빠르게 본다.
 - 학습용 가상환경의 python 으로 실행한다 (기본 커널 python3 이 그 환경을 쓴다).
 - v2 노트북(--notebook lora_training_v2.ipynb)이면 target_scope, preservation, class_word 도 줄 수 있다 (빼면 노트북 기본값).
+- 영상 노트북(--notebook lora_training_video.ipynb)이면 target_scope(all·attn·kvo), expert, class_word, caption_fixed_words,
+  fixed_overrides({키: 값})를 줄 수 있다. family 는 빼거나 "auto" 로 두면 노트북이 model_path 로 정한다 (--test 에는 계열 이름이 필요).
+  영상 노트북 6 보완 단계가 만든 next_run.json 을 그대로 목록으로 쓸 수 있다 (why, previous 는 설명용이라 무시한다).
 - 메인 서버에서는 허브에 학습 작업이 생기기 전까지 관리자 '대기열 멈춤' 상태에서만 돌린다 (계획서 P2).
 """
 import argparse
@@ -46,9 +49,17 @@ KEYS = {  # 목록 파일의 키 → 노트북 환경변수
     "validation_file": "LORA_VALIDATION_FILE",
     "target_scope": "LORA_TARGET_SCOPE",     # v2 노트북만
     "preservation": "LORA_PRESERVATION",     # v2 노트북만
-    "class_word": "LORA_CLASS_WORD",         # v2 노트북만
+    "class_word": "LORA_CLASS_WORD",         # v2·영상 노트북
+    "expert": "LORA_EXPERT",                 # 영상 노트북만 (A14B 전문가)
+    "caption_fixed_words": "LORA_CAPTION_FIXED_WORDS",   # 영상 노트북만
+    "fixed_overrides": "LORA_FIXED_OVERRIDES",           # 영상 노트북만, {키: 값} → JSON
 }
-V2_CHOICES = {"target_scope": ("attn", "attn_all", "attn_mlp", "all"), "preservation": ("dop", "off")}
+INFO_KEYS = {"why", "previous"}              # 영상 노트북 next_run.json 의 설명 (실행에는 쓰지 않음)
+OBJECT_KEYS = {"fixed_overrides"}            # 문자열이 아니라 {키: 값} 으로 받는 키
+OPTIONAL_KEYS = ("target_scope", "preservation", "class_word", "expert", "caption_fixed_words")
+V2_CHOICES = {"target_scope": ("attn", "attn_all", "attn_mlp", "all"), "preservation": ("dop", "off"),
+              "expert": ("auto", "both", "low", "high")}
+VIDEO_SCOPES = ("all", "attn", "kvo", "attn_mlp", "attn_all")   # 영상 노트북 (attn_mlp = all, attn_all = attn)
 REQUIRED = ["family", "model_path", "dataset_dir", "trigger", "run_name"]
 RUN_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
 HF_REPO = re.compile(r"[\w.-]+/[\w.-]+")   # 노트북 check_model_path 와 같은 규칙
@@ -58,9 +69,9 @@ LOG_FIELDS = ["started", "mode", "run_name", "family", "model_path", "status", "
 
 
 def supported_families(nb):
-    """노트북의 어댑터 셀(%%writefile lora_adapters/<계열>.py)에서 지원 계열을 읽는다."""
+    """노트북의 어댑터 셀(%%writefile lora_adapters/<계열>.py, 영상은 lora_video_adapters/)에서 지원 계열을 읽는다."""
     return {m.group(1) for c in nb.cells if c.cell_type == "code"
-            for m in [re.match(r"%%writefile lora_adapters/(\w+)\.py", c.source)] if m}
+            for m in [re.match(r"%%writefile (?:lora_adapters|lora_video_adapters)/(\w+)\.py", c.source)] if m}
 
 
 def resolve(base, p):
@@ -70,6 +81,11 @@ def resolve(base, p):
 
 def check_model_path(base, mp):
     """로컬 diffusers 형식 폴더면 절대 경로로, Hugging Face 저장소 이름이면 그대로 돌려준다."""
+    mp = mp.strip()
+    if re.match(r"https?://(?:www\.)?huggingface\.co/", mp):          # 저장소 주소를 붙여 넣은 경우
+        mp = re.sub(r"/(?:tree|blob|resolve)/.*$", "", re.sub(r"^https?://(?:www\.)?huggingface\.co/", "", mp))
+    if not resolve(base, mp).exists():
+        mp = mp.rstrip("/\\")
     p = resolve(base, mp)
     if p.exists():
         if not (p / "model_index.json").is_file():
@@ -85,8 +101,9 @@ def notebook_env_names(nb):
     return {m for c in nb.cells if c.cell_type == "code" for m in re.findall(r"LORA_[A-Z_]+", c.source)}
 
 
-def load_plan(path, fams, test, nb_env):
-    """목록 파일을 실행 목록으로 바꾼다. 문제는 모두 모아 보여 주고, 하나라도 있으면 아무것도 실행하지 않는다."""
+def load_plan(path, fams, test, nb_env, auto_family=False, video=False):
+    """목록 파일을 실행 목록으로 바꾼다. 문제는 모두 모아 보여 주고, 하나라도 있으면 아무것도 실행하지 않는다.
+    auto_family: 노트북이 model_path 로 계열을 정한다 (영상 노트북) → family 를 빼거나 "auto" 로 둘 수 있다."""
     try:
         plan = json.loads(path.read_text(encoding="utf-8-sig"))
     except (OSError, ValueError) as e:
@@ -98,23 +115,37 @@ def load_plan(path, fams, test, nb_env):
     if not isinstance(defaults, dict):
         errors.append("defaults: {...} 형태여야 합니다")
         defaults = {}
-    errors += [f"defaults: 모르는 키 '{k}'" for k in defaults if k not in KEYS]
+    errors += [f"defaults: 모르는 키 '{k}'" for k in defaults if k not in KEYS and k not in INFO_KEYS]
     for i, item in enumerate(plan["runs"]):
         at = f"runs[{i}]"
         if not isinstance(item, dict):
             errors.append(f"{at}: {{...}} 형태여야 합니다")
             continue
-        errors += [f"{at}: 모르는 키 '{k}'" for k in item if k not in KEYS]
-        r = {"output_dir": "outputs", "validation_file": "", **defaults, **item}
-        wrong = [k for k in KEYS if k in r and not isinstance(r[k], str)]
+        errors += [f"{at}: 모르는 키 '{k}'" for k in item if k not in KEYS and k not in INFO_KEYS]
+        r = {"output_dir": "outputs_video" if video else "outputs", "validation_file": "", **defaults, **item}
+        for k in OBJECT_KEYS:                    # {키: 값} 대신 그 JSON 문자열을 줘도 받는다
+            if isinstance(r.get(k), str) and r[k].strip():
+                try:
+                    r[k] = json.loads(r[k])
+                except ValueError:
+                    pass
+        if auto_family and not str(r.get("family", "")).strip():
+            r["family"] = "auto"
+        wrong = [k for k in KEYS if k in r and k not in OBJECT_KEYS and not isinstance(r[k], str)]
+        wrong_obj = [k for k in OBJECT_KEYS if k in r and r[k] != "" and not isinstance(r[k], dict)]
         missing = [k for k in REQUIRED if k not in wrong and not str(r.get(k, "")).strip()]
-        if wrong or missing:
+        if wrong or wrong_obj or missing:
             if wrong:
                 errors.append(f"{at}: 문자열이어야 하는 값: {', '.join(wrong)}")
+            if wrong_obj:
+                errors.append(f"{at}: {{키: 값}} 이나 그 JSON 문자열이어야 하는 값: {', '.join(wrong_obj)}")
             if missing:
                 errors.append(f"{at}: 빠진 값: {', '.join(missing)}")
             continue
-        if r["family"] not in fams:
+        if r["family"] == "auto" and auto_family:
+            if test:
+                errors.append(f"{at}: 시험 모드(--test)는 family 에 계열 이름이 필요합니다 (지원: {', '.join(sorted(fams))})")
+        elif r["family"] not in fams:
             errors.append(f"{at}: 노트북이 지원하지 않는 계열 '{r['family']}' (지원: {', '.join(sorted(fams))})")
         if not RUN_NAME.fullmatch(r["run_name"]):
             errors.append(f"{at}: run_name 은 영문·숫자로 시작하고 영문·숫자·. _ - 만 씁니다: {r['run_name']}")
@@ -130,15 +161,20 @@ def load_plan(path, fams, test, nb_env):
             if not vf.is_file():
                 errors.append(f"{at}: 검증 프롬프트 파일이 없습니다: {vf}")
             env["LORA_VALIDATION_FILE"] = str(vf)
-        for k in ("target_scope", "preservation", "class_word"):
+        for k in OPTIONAL_KEYS:
             v = r.get(k, "").strip()
             if not v:
                 continue
             if KEYS[k] not in nb_env:
-                errors.append(f"{at}: 이 노트북은 '{k}' 를 쓰지 않습니다 (v2 노트북: --notebook lora_training_v2.ipynb)")
-            elif k in V2_CHOICES and v not in V2_CHOICES[k]:
-                errors.append(f"{at}: {k} 는 {', '.join(V2_CHOICES[k])} 중 하나여야 합니다: {v}")
+                errors.append(f"{at}: 이 노트북은 '{k}' 를 쓰지 않습니다 (v2: lora_training_v2.ipynb, 영상: lora_training_video.ipynb)")
+            elif k in V2_CHOICES and v not in (VIDEO_SCOPES if video and k == "target_scope" else V2_CHOICES[k]):
+                errors.append(f"{at}: {k} 는 {', '.join(VIDEO_SCOPES if video and k == 'target_scope' else V2_CHOICES[k])}"
+                              f" 중 하나여야 합니다: {v}")
             env[KEYS[k]] = v
+        if r.get("fixed_overrides"):
+            if KEYS["fixed_overrides"] not in nb_env:
+                errors.append(f"{at}: 이 노트북은 'fixed_overrides' 를 쓰지 않습니다 (영상 노트북: --notebook lora_training_video.ipynb)")
+            env[KEYS["fixed_overrides"]] = json.dumps(r["fixed_overrides"], ensure_ascii=False)
         if not test:   # 시험 모드는 작은 무작위 모델과 가짜 데이터셋을 쓰므로 경로를 보지 않는다
             if not Path(env["LORA_DATASET_DIR"]).is_dir():
                 errors.append(f"{at}: 데이터셋 폴더가 없습니다: {env['LORA_DATASET_DIR']}")
@@ -202,7 +238,7 @@ def fmt(v, spec):
 def describe(s):
     return (f"학습 {fmt(s.get('train_minutes'), '.1f')}분, 최대 GPU {fmt(s.get('peak_gpu_gb'), '.1f')}GB, "
             f"LoRA {fmt(s.get('lora_file_mb'), '.1f')}MB, 마지막 손실 {fmt(s.get('final_train_loss'), '.4f')}, "
-            f"검증 손실 최저 단계 {s.get('best_val_step', '-')}")
+            f"검증 손실 최저 단계 {fmt(s.get('best_val_step'), 'd')}")
 
 
 def run_one(run, nb_path, args):
@@ -222,6 +258,7 @@ def run_one(run, nb_path, args):
                     resources={"metadata": {"path": str(nb_path.parent)}}).execute()
         summary = json.loads((run_dir / "summary.json").read_text(encoding="utf-8"))
         status, note = "완료", describe(summary)
+        run["family"] = summary.get("family") or run["family"]   # family 를 auto 로 둔 영상 실행: 노트북이 정한 계열
     except KeyboardInterrupt:
         status, note = "중단", "사용자가 멈춤"
         raise
@@ -253,7 +290,9 @@ def main():
 
     nb_path = args.notebook.resolve()
     nb = nbformat.read(nb_path, as_version=4)
-    runs = load_plan(args.plan.resolve(), supported_families(nb), args.test, notebook_env_names(nb))
+    auto_family = any(c.cell_type == "code" and "def detect_family(" in c.source for c in nb.cells)
+    video = any(c.cell_type == "code" and c.source.startswith("%%writefile lora_video_adapters/") for c in nb.cells)
+    runs = load_plan(args.plan.resolve(), supported_families(nb), args.test, notebook_env_names(nb), auto_family, video)
     print(f"{'시험' if args.test else '학습'} {len(runs)}건 | 노트북 {nb_path} | 커널 {args.kernel}"
           + (" | --dry-run: 실행하지 않음" if args.dry_run else ""))
     if not args.test and not args.dry_run:
@@ -277,6 +316,7 @@ def main():
                 continue
             print(f"\n{head}: 시작 {datetime.now():%Y-%m-%d %H:%M:%S}", flush=True)
             status, note = run_one(run, nb_path, args)
+            head = f"[{n}/{len(runs)}] {run['name']} ({run['family']})"   # auto 였으면 노트북이 정한 계열
             print(f"{head}: {status}  {note}", flush=True)
             results.append((run, status, note))
             if status != "완료" and args.stop_on_error:
